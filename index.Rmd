@@ -1,0 +1,145 @@
+---
+title: "Weight lifting data analysis"
+author: "Fernando Sim?o e Silva"
+date: "Friday, July 22, 2016"
+output: html_document
+---
+
+#Summary
+
+This report presents a prediction model fitting exercise for data related to weightlifting activity and signals captured by movement sensors. A dataset has been provided with signals detected by the sensors alongside with a classification of "correctedness" (i.e, how well the subject performed the exercise). The goal is to find a prediction model relating the sensor data to the performance of the test subjects.
+
+```{r}
+library(knitr) #Supressing warnings and messages
+opts_chunk$set(message = FALSE, warning = FALSE)
+```
+
+#Preprocessing of the data
+
+```{r}
+library(caret)
+data <- read.csv("pml-training.csv"); finalTest <- read.csv("pml-testing.csv")
+```
+
+By using the View command in R, it is possible to notice that many columns have a predominance of either NAs or empty character strings. However, a trend is noticeable: all those columns have a values in the same rows, which happens wherever the *new_window* column's value is "yes". In fact, a quick test shows that those rows have no missing values or empty strings:
+
+```{r}
+mean(is.na(data[data$new_window == "yes", ]))
+mean(data[data$new_window == "yes", ] == "")
+```
+
+That can be explained by the article from which the data came: certain variables are measured continuously during the trajectory of the dumbbell, while others are only measured at the end (or beginning) or a repetition - hence the "new window".
+
+There are two reasons not to include those variables in the model: they have few values (only `r sum(data$new_window=="yes")` out of `r dim(data)[1]` entries) and they are completely absent from the testing dataset (sum(finalTest$new\_window == "yes") = `r sum(finalTest$new_window == "yes")`), meaning that, if they are used in the model, their presence will make no difference for model validation.
+
+All the columns without continuous measurements (in other words, with discrete measurements) will be detected and eliminated from the training dataset.
+
+```{r}
+#Detecting all the columns that have 100% missing values or empty character strings when new_window = "no"
+discrete <- sapply(data[data$new_window == "no", ],
+                   function(x) mean(is.na(x) | x == ""))
+discrete <- discrete == 1
+data <- data[, !discrete]
+dim(data)
+```
+
+Now, the training dataset has fewer columns, as shown above. Examining the names of the remaining variables, it is possible to notice that the 7 first ones are not suitable to be used as predictors, since they represent other types of information, like time and name of test subject. Those ones are removed too.
+
+```{r}
+names(data)[1:7]
+users <- data$user_name
+data <- data[, -(1:7)]
+```
+
+##Outlier removal
+
+The dataset has a number of observations that deviate impossibly from the rest, as shown in the figure below. All values that deviate from the mean more than 10 times the standard deviation will be eliminated and replaced with the mean of the variable in question.
+
+```{r}
+library(reshape2)
+std_data <- sapply(data[,1:52], function(x) (x-mean(x))/sd(x))
+std_data <- as.data.frame(std_data)
+ggplot(aes(x=variable, y=value), data=
+             melt(std_data, measure.vars = 1:52)) +
+      geom_boxplot() +
+      labs(x = "Variable", y = "Standardized value (mean = 0, sd = 1)",
+           title = "Variability in measured values") +
+      theme(axis.text.x = element_text(angle = 90, vjust=0.5))
+data[, 1:52][abs(std_data) > 10] <- NA
+NAs <- which(abs(std_data) > 10, arr.ind=TRUE)
+data[, 1:52][NAs] <- colMeans(data[, 1:52], na.rm=TRUE)[NAs[,2]]
+```
+
+#Model fitting
+
+Before fitting the models, the data will be divided into a training and a testing set.
+
+```{r partitioning}
+inTrain <- createDataPartition(data$classe, p = 0.6, list = FALSE)
+training <- data[inTrain, ]
+testing <- data[-inTrain, ]
+```
+
+Three different models will be tried: a classification and regression tree, a random forests model and a gradient boosted model (all with the default parameter configurations). If any of the individual models presents enough in-sample accuracy, it will be chosen for validation with the testing set. Priority will be given to the CART model, since it is the simplest one. In case none of the methods achieves at least 90% accuracy, a combination of them will be tried.
+
+```{r}
+set.seed(5472)
+modCART <- train(classe ~ ., data = training, method = "rpart")
+set.seed(5472)
+modRF <- train(classe ~ ., data = training, method = "rf")
+set.seed(5472)
+modGBM <- train(classe ~ ., data = training, method = "gbm", verbose = FALSE)
+
+#In-sample accuracy calculation
+#CART model:
+mean(predict(modCART, training) == training$classe)
+#Random forest model
+mean(predict(modRF, training) == training$classe)
+#Gradient Boosted model
+mean(predict(modGBM, training) == training$classe)
+```
+
+As seen above, the gradient boosted method has satisfactory accuracy by itself, eliminating the need for combining predictors. The random forests model appears to have a perfect fit, but still requires validation on the testing set due to the possibility of overfitting. Applying both models to the testing dataset, we obtain the following estimate for out-of-sample accuracy:
+
+```{r}
+mean(predict(modGBM, testing) == testing$classe)
+mean(predict(modRF, testing) == testing$classe)
+```
+
+As seen, the out-of-sample error for both models is well below 10%, making them both appropriate for prediction. Therefore, the RF model will be used for predicting the classification of the 20 cases in the testing dataset provided in the assignment. The predicted classifications are the following:
+
+```{r}
+predict(modRF, finalTest)
+```
+
+```{r unsed_cart_model, echo=FALSE, eval=FALSE}
+trainspl <- split(training, users[inTrain])
+models <- list()
+preds <- data.frame(classe = training$classe)
+for(i in 1:length(trainspl)) {
+      models[[i]] <- train(classe ~ ., data=trainspl[[i]], method="rpart")
+      preds[, names(trainspl)[i]] <- predict(models[[i]], training)
+}
+models[[length(trainspl)+1]] <- train(classe ~ ., data=training, method="rpart")
+preds$all <- predict(models[[length(trainspl)+1]], training)
+
+system.time(boostModel <- train(classe ~ ., data=preds, method="gbm", verbose=FALSE, n.trees=25))
+#boostModel <- train(classe ~ ., data=preds, method="rf")
+#boostModel2 <- train(classe ~ ., data=preds, method="rpart") Muito ruim
+
+getmode <- function(v) {
+   uniqv <- unique(v)
+   uniqv[which.max(tabulate(match(v, uniqv)))]
+}
+num <- sapply(preds, as.integer)
+majority <- apply(num, 1, getmode)
+majority <- factor(majority, labels=c("A","B","C","D","E"))
+preds$majority <- majority
+
+predsTest <- list()
+for(i in 1:length(models)) {
+      predsTest[[names(trainspl)[i]]] <- predict(models[[i]], testing)
+}
+predsTest <- as.data.frame(predsTest)
+predictions <- predict(boostModel, predsTest)
+```
